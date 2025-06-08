@@ -106,6 +106,7 @@ in
     tmux
     firefox
     nftables
+    git
   ];
 
   # Set your time zone.
