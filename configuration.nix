@@ -3,8 +3,24 @@
 # and in the NixOS manual (accessible by running ‘nixos-help’).
 
 { lib, config, pkgs, ... }:
+
 let
   publicDnsServer = "8.8.8.8";
+  
+  # Interface Definitions
+  wanInterface = "enp0s20f0u3i1";
+  phyInterface = "enp1s0";
+  
+  # Network Segmentation
+  vlanMgmtId = 10;
+  vlanLabId = 20;
+  
+  mgmtInterface = "vlan${toString vlanMgmtId}";
+  labInterface = "vlan${toString vlanLabId}";
+  
+  # Subnets
+  mgmtIp = "10.13.10.1";
+  labIp = "10.13.20.1";
 in
 {
   imports =
@@ -17,23 +33,32 @@ in
 
   boot.kernel.sysctl = {
     "net.ipv4.conf.all.forwarding" = true;
+    "net.ipv4.icmp_echo_ignore_broadcasts" = true; 
+    "net.ipv4.conf.all.rp_filter" = 1;
   };
 
   networking = {
     hostName = "nix-router";
     nameservers = [ "${publicDnsServer}" ];
-    firewall.enable = false;
+    firewall.enable = false; # Disabling default firewall to use custom nftables
+
+    vlans = {
+      "${mgmtInterface}" = { id = vlanMgmtId; interface = phyInterface; };
+      "${labInterface}" = { id = vlanLabId; interface = phyInterface; };
+    };
 
     interfaces = {
-      enp0s20f0u3i1 = {
-        useDHCP = true;
-      };
-      enp1s0 = {
+      "${wanInterface}" = { useDHCP = true; };
+      "${phyInterface}" = { useDHCP = false; }; # Physical link, no IP
+      
+      "${mgmtInterface}" = {
         useDHCP = false;
-        ipv4.addresses = [{
-          address = "10.13.84.1";
-          prefixLength = 24;
-        }];
+        ipv4.addresses = [{ address = mgmtIp; prefixLength = 24; }];
+      };
+
+      "${labInterface}" = {
+        useDHCP = false;
+        ipv4.addresses = [{ address = labIp; prefixLength = 24; }];
       };
     };
 
@@ -43,32 +68,50 @@ in
         table ip filter {
           chain input {
             type filter hook input priority 0; policy drop;
-            iifname "lo" accept comment "Allow loopback";
-            iifname { "enp1s0" } accept comment "Allow local network (LAN) to access the router";
-            ct state { established, related } accept comment "Allow established/related traffic";
-            iifname "enp0s20f0u3i1" icmp type { echo-request, destination-unreachable, time-exceeded } counter accept comment "Allow select ICMP from WAN";
+
+            iifname "lo" accept comment "Trust Localhost"
+            ct state { established, related } accept comment "Stateful: Allow return traffic"
+            ct state invalid drop comment "Sanity: Drop invalid packets early"
+
+            # Management Plane
+            iifname "${mgmtInterface}" tcp dport 22 accept comment "Allow SSH from Mgmt VLAN only"
+
+            # Infra for lab - Block everything but DNS/DHCP
+            iifname "${labInterface}" udp dport { 53, 67 } accept comment "Allow DNS/DHCP from Lab"
+            iifname "${labInterface}" tcp dport 53 accept comment "Allow DNS TCP from Lab"
+            
+            # WAN ICMP (Limited)
+            iifname "${wanInterface}" icmp type { echo-request, destination-unreachable, time-exceeded } counter accept
+            
+            limit rate 5/minute burst 5 packets log prefix "NFT-DROP-INPUT: " 
           }
+
           chain forward {
             type filter hook forward priority 0; policy drop;
-            # LAN to WAN: allow
-            iifname "enp1s0" oifname "enp0s20f0u3i1" accept comment "Allow trusted LAN to WAN";
-            # WAN to LAN: allow established/related
-            iifname "enp0s20f0u3i1" oifname "enp1s0" ct state established,related accept comment "Allow established back to LAN";
+
+            iifname "${labInterface}" oifname "${wanInterface}" accept comment "Lab -> Internet"
+            iifname "${mgmtInterface}" oifname "${wanInterface}" accept comment "Mgmt -> Internet"
+            iifname "${wanInterface}" ct state established,related accept comment "Internet -> LAN (Return)"
+            iifname "${labInterface}" oifname "${mgmtInterface}" drop comment "Block Lab to Mgmt"
+            limit rate 5/minute burst 5 packets log prefix "NFT-DROP-FWD: "
           }
         }
+
         table ip nat {
+          chain prerouting {
+            type nat hook prerouting priority -100; policy accept;
+            # uncomment to hook lab http traffic
+            # iifname "${labInterface}" tcp dport 80 tproxy to :8080 meta mark set 1 accept
+          }
           chain postrouting {
             type nat hook postrouting priority 100; policy accept;
-            oifname "enp0s20f0u3i1" masquerade comment "NAT for LAN to WAN";
+            oifname "${wanInterface}" masquerade comment "NAT Source Hiding"
           } 
         }
+
         table ip6 filter {
-          chain input {
-            type filter hook input priority 0; policy drop;
-          }
-          chain forward {
-            type filter hook forward priority 0; policy drop;
-          }
+          chain input { type filter hook input priority 0; policy drop; }
+          chain forward { type filter hook forward priority 0; policy drop; }
         }
       '';
     };
@@ -77,25 +120,28 @@ in
   services = {
     openssh = {
       enable = true;
-      settings.PermitRootLogin = "yes";
+      settings = {
+        PermitRootLogin = "no";
+        PasswordAuthentication = false;
+        AllowUsers = [ "jared" ];
+      };
     };
     
     dnsmasq = {
       enable = true;
       settings = {
-        interface = [ "enp1s0" ]; # interface to serve DHCP leases
-        "dhcp-range" = "10.13.84.2,10.13.84.254,255.255.255.0,12h"; # DHCP range and lease time 12 hours
+        interface = [ "${labInterface}" ]; # bind to lab
+        "dhcp-range" = "${labIp},10.13.20.254,255.255.255.0,12h";
         "dhcp-option" = [
-	   "3,10.13.84.1" # 3 is router (gateway)
-	   "6,10.13.84.1" # 6 is domain-name-servers
-	];
-        "server" = [ "${publicDnsServer}"]; # upstream DNS server
-        "no-resolv" = true; # explicitly avoid reading /etc/resolv.conf
+           "3,${labIp}" # Gateway
+           "6,${labIp}" # DNS
+        ];
+        "server" = [ "${publicDnsServer}"]; 
+        "no-resolv" = true; 
         "cache-size" = 150;
         log-queries = true;
       };
     };
-
   };
 
   environment.systemPackages = with pkgs; [
@@ -103,43 +149,25 @@ in
     tcpdump
     htop
     vim
+	sl
     tmux
-    firefox
     nftables
     git
+    nmap 
+    socat
   ];
 
-  # Set your time zone.
   time.timeZone = "America/New_York";
-
-  # Enable the X11 windowing system.
-  # You can disable this if you're only using the Wayland session.
-  services.xserver.enable = true;
-
-  # Enable the KDE Plasma Desktop Environment.
-  services.displayManager.sddm.enable = true;
-  services.desktopManager.plasma6.enable = true;
-
-  # Configure keymap in X11
-  services.xserver.xkb = {
-    layout = "us";
-    options = "caps:swapescape";
-    variant = "";
-  };
+  services.xserver.enable = false;
 
   users.users.jared = {
     isNormalUser = true;
     description = "Jared";
     extraGroups = [ "networkmanager" "wheel" ];
-    packages = with pkgs; [
-      kdePackages.kate
-    ];
+    # make sure to add your public key before using this config!
+    # openssh.authorizedKeys.keys = [ "ssh-ed25519 ..." ];
+    packages = with pkgs; [];
   };
-
-  services.logind.extraConfig = ''
-    IdleAction = ignore;
-  '';
 
   system.stateVersion = "25.05";
 }
-
